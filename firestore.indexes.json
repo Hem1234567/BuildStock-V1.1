@@ -1,0 +1,115 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "sales",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "document_status", "order": "ASCENDING"},
+        {"fieldPath": "invoice_date", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "sales",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "customer_id", "order": "ASCENDING"},
+        {"fieldPath": "invoice_date", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "sale_items",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "sale_id", "order": "ASCENDING"},
+        {"fieldPath": "sort_order", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "purchases",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "supplier_id", "order": "ASCENDING"},
+        {"fieldPath": "purchase_date", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "purchase_items",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "purchase_id", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "stock_movements",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "product_id", "order": "ASCENDING"},
+        {"fieldPath": "occurred_at", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "stock_movements",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "store_id", "order": "ASCENDING"},
+        {"fieldPath": "occurred_at", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "payments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "party_id", "order": "ASCENDING"},
+        {"fieldPath": "paid_at", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "deliveries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "status", "order": "ASCENDING"},
+        {"fieldPath": "delivery_date", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "deliveries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "driver_id", "order": "ASCENDING"},
+        {"fieldPath": "delivery_date", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "attendance",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "staff_id", "order": "ASCENDING"},
+        {"fieldPath": "date", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "salary_records",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "person_id", "order": "ASCENDING"},
+        {"fieldPath": "period_start", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "salary_records",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "status", "order": "ASCENDING"},
+        {"fieldPath": "period_end", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "expenses",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "paid_at", "order": "DESCENDING"}
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

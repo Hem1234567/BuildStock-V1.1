@@ -1,0 +1,518 @@
+rules_version = '2';
+
+// ============================================================================
+// BuildStock — Firestore security rules
+// Business: Vijay Balaji Agency
+// Model: shops/{shopId}/<collection>/{documentId}
+//
+// Principles
+//  * Deny by default. Every path is scoped to a shop membership document.
+//  * Membership is authoritative for role and permissions; UI checks are not.
+//  * Finalized financial documents are immutable. Corrections use returns,
+//    cancellations and credit/debit notes (separate records).
+//  * Stock movements, payments and audit logs are append-only.
+//  * Payment and sync-operation documents use deterministic client IDs so a
+//    retried offline operation cannot create a duplicate.
+//  * No secrets, passwords or bank credentials are stored in Firestore by the
+//    client; only business configuration explicitly entered by the owner.
+// ============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function memberPath(shopId) {
+      return /databases/$(database)/documents/shops/$(shopId)/users/$(request.auth.uid);
+    }
+
+    function hasMembership(shopId) {
+      return signedIn() && exists(memberPath(shopId));
+    }
+
+    function membership(shopId) {
+      return get(memberPath(shopId)).data;
+    }
+
+    function isActiveMember(shopId) {
+      return hasMembership(shopId) && membership(shopId).active == true;
+    }
+
+    function memberRole(shopId) {
+      return isActiveMember(shopId) ? membership(shopId).role : '';
+    }
+
+    function isOwnerOrAdmin(shopId) {
+      return isActiveMember(shopId) &&
+        (memberRole(shopId) == 'owner' || memberRole(shopId) == 'admin');
+    }
+
+    // Permission strings mirror the app's permission catalog.
+    function can(shopId, permission) {
+      return isActiveMember(shopId) &&
+        (memberRole(shopId) == 'owner' ||
+         memberRole(shopId) == 'admin' ||
+         (membership(shopId).permissions is list &&
+          permission in membership(shopId).permissions));
+    }
+
+    function isNonEmptyString(value, maxLength) {
+      return value is string && value.size() > 0 && value.size() <= maxLength;
+    }
+
+    function isOptionalString(value, maxLength) {
+      return value == null || (value is string && value.size() <= maxLength);
+    }
+
+    function isMoney(value) {
+      return value is int && value >= 0;
+    }
+
+    function isNonNegativeNumber(value) {
+      return value is number && value >= 0;
+    }
+
+    function hasRequiredEntityFields(data) {
+      return isNonEmptyString(data.id, 128) &&
+        isNonEmptyString(data.shop_id, 128) &&
+        isNonEmptyString(data.device_id, 128) &&
+        data.version is int && data.version >= 1 &&
+        data.updated_at is timestamp;
+    }
+
+    function onlySyncFieldsChanged() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+        .hasOnly(['sync_status', 'updated_at', 'server_updated_at', 'last_operation_id']);
+    }
+
+    function isFinalized(resourceData) {
+      return resourceData.document_status == 'finalized' ||
+        resourceData.status == 'finalized' ||
+        resourceData.status == 'paid';
+    }
+
+    // ------------------------------------------------------------------
+    // Identity profiles (root level)
+    // ------------------------------------------------------------------
+    match /users/{userId} {
+      allow read: if signedIn() && request.auth.uid == userId;
+      allow create: if signedIn() && request.auth.uid == userId &&
+        request.resource.data.uid == userId &&
+        isNonEmptyString(request.resource.data.display_name, 120);
+      allow update: if signedIn() && request.auth.uid == userId &&
+        request.resource.data.uid == userId &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['display_name', 'phone', 'photo_url', 'updated_at', 'last_seen_at']);
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // Shop invites. A random document ID acts as the invite secret; the
+    // invited email must match the authenticated account.
+    // ------------------------------------------------------------------
+    match /invites/{inviteId} {
+      allow get: if signedIn() &&
+        (resource.data.email == request.auth.token.email || isOwnerOrAdmin(resource.data.shop_id));
+      allow list: if false; // invite codes are not enumerable
+      allow create: if signedIn() && can(request.resource.data.shop_id, 'manage_users') &&
+        isNonEmptyString(inviteId, 64) &&
+        request.resource.data.shop_id is string &&
+        request.resource.data.email == request.resource.data.email.lower() &&
+        isNonEmptyString(request.resource.data.email, 254) &&
+        request.resource.data.role in ['admin', 'manager', 'cashier', 'staff', 'driver', 'accountant'] &&
+        request.resource.data.used == false &&
+        request.resource.data.expires_at is timestamp;
+      allow update: if signedIn() &&
+        resource.data.used == false &&
+        request.resource.data.used == true &&
+        request.resource.data.used_by == request.auth.uid &&
+        request.auth.token.email == resource.data.email &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['used', 'used_by', 'used_at']);
+      allow delete: if signedIn() && can(resource.data.shop_id, 'manage_users');
+    }
+
+    // ------------------------------------------------------------------
+    // Shops and members
+    // ------------------------------------------------------------------
+    match /shops/{shopId} {
+      allow get: if isActiveMember(shopId);
+      allow list: if false;
+      allow create: if signedIn() &&
+        shopId == request.auth.uid &&
+        request.resource.data.owner_id == request.auth.uid &&
+        request.resource.data.id == shopId &&
+        isNonEmptyString(request.resource.data.name, 160);
+      allow update: if isOwnerOrAdmin(shopId) &&
+        request.resource.data.owner_id == resource.data.owner_id &&
+        request.resource.data.id == shopId;
+      allow delete: if false;
+
+      match /users/{userId} {
+        allow get: if isActiveMember(shopId) || (signedIn() && request.auth.uid == userId);
+        allow list: if isActiveMember(shopId);
+        allow create: if signedIn() && request.auth.uid == userId &&
+          request.resource.data.uid == userId &&
+          request.resource.data.shop_id == shopId &&
+          request.resource.data.active == true &&
+          (
+            // Bootstrap: the owner creating the shop in the same commit.
+            (userId == shopId && userId == request.auth.uid) ||
+            // Staff redeeming a single-use invite addressed to their email.
+            (
+              request.resource.data.role in ['admin', 'manager', 'cashier', 'staff', 'driver', 'accountant'] &&
+              isNonEmptyString(request.resource.data.invite_code, 64) &&
+              exists(/databases/$(database)/documents/invites/$(request.resource.data.invite_code)) &&
+              get(/databases/$(database)/documents/invites/$(request.resource.data.invite_code)).data.shop_id == shopId &&
+              get(/databases/$(database)/documents/invites/$(request.resource.data.invite_code)).data.email == request.auth.token.email &&
+              get(/databases/$(database)/documents/invites/$(request.resource.data.invite_code)).data.used == false
+            ) ||
+            // Owner/admin adding a known account directly.
+            can(shopId, 'manage_users')
+          );
+        allow update: if
+          (
+            // A member may update only their own non-security profile fields.
+            signedIn() && request.auth.uid == userId &&
+            request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['display_name', 'phone', 'photo_url', 'last_seen_at', 'updated_at'])
+          ) ||
+          (
+            can(shopId, 'manage_users') &&
+            request.resource.data.role in ['admin', 'manager', 'cashier', 'staff', 'driver', 'accountant'] &&
+            request.resource.data.owner_id == resource.data.owner_id
+          );
+        allow delete: if false;
+      }
+
+      // Everything below is business data. Reads require active membership.
+      // Writes require an explicit permission. Permission strings are defined
+      // in lib/core/security/permissions.dart and must stay in sync.
+
+      match /business_profile/{profileId} {
+        allow read: if isActiveMember(shopId);
+        allow create, update: if can(shopId, 'manage_business_settings') &&
+          request.resource.data.id == profileId;
+        allow delete: if false;
+      }
+
+      match /settings/{settingId} {
+        allow read: if isActiveMember(shopId);
+        allow write: if can(shopId, 'manage_business_settings');
+      }
+
+      match /devices/{deviceId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if isActiveMember(shopId) &&
+          request.resource.data.id == deviceId &&
+          request.resource.data.shop_id == shopId;
+        allow update: if isActiveMember(shopId) &&
+          resource.data.id == deviceId &&
+          request.resource.data.shop_id == shopId;
+        allow delete: if isOwnerOrAdmin(shopId);
+      }
+
+      match /products/{productId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_products') && request.resource.data.id == productId;
+        allow update: if can(shopId, 'manage_products') &&
+          resource.data.id == productId &&
+          request.resource.data.version > resource.data.version;
+        allow delete: if false; // archive only
+      }
+
+      match /categories/{categoryId} {
+        allow read: if isActiveMember(shopId);
+        allow write: if can(shopId, 'manage_products') && request.resource.data.id == categoryId;
+      }
+
+      match /brands/{brandId} {
+        allow read: if isActiveMember(shopId);
+        allow write: if can(shopId, 'manage_products') && request.resource.data.id == brandId;
+      }
+
+      match /units/{unitId} {
+        allow read: if isActiveMember(shopId);
+        allow write: if can(shopId, 'manage_products') && request.resource.data.id == unitId;
+      }
+
+      match /price_lists/{priceListId} {
+        allow read: if isActiveMember(shopId);
+        allow write: if can(shopId, 'manage_products') && request.resource.data.id == priceListId;
+      }
+
+      match /inventory/{inventoryId} {
+        allow read: if isActiveMember(shopId);
+        // Inventory is a projection of the stock movement ledger. It is only
+        // written by the sync engine alongside a stock movement.
+        allow write: if can(shopId, 'manage_inventory') &&
+          request.resource.data.id == inventoryId;
+      }
+
+      match /stock_movements/{movementId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_inventory') &&
+          request.resource.data.id == movementId &&
+          request.resource.data.shop_id == shopId;
+        allow update, delete: if false; // append-only ledger
+      }
+
+      match /stock_transfers/{transferId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_inventory') &&
+          request.resource.data.id == transferId;
+        allow update: if can(shopId, 'manage_inventory') &&
+          resource.data.id == transferId &&
+          request.resource.data.version > resource.data.version;
+        allow delete: if false;
+      }
+
+      match /stock_transfer_items/{itemId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_inventory');
+        allow update: if can(shopId, 'manage_inventory') &&
+          request.resource.data.version > resource.data.version;
+        allow delete: if false;
+      }
+
+      match /customers/{customerId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_customers') && request.resource.data.id == customerId;
+        allow update: if can(shopId, 'manage_customers') &&
+          resource.data.id == customerId &&
+          request.resource.data.version > resource.data.version;
+        allow delete: if false; // archive only
+      }
+
+      match /suppliers/{supplierId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_suppliers') && request.resource.data.id == supplierId;
+        allow update: if can(shopId, 'manage_suppliers') &&
+          resource.data.id == supplierId &&
+          request.resource.data.version > resource.data.version;
+        allow delete: if false;
+      }
+
+      match /staff/{staffId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_staff') && request.resource.data.id == staffId;
+        allow update: if can(shopId, 'manage_staff') &&
+          resource.data.id == staffId &&
+          request.resource.data.version > resource.data.version;
+        allow delete: if false;
+      }
+
+      match /drivers/{driverId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_drivers') && request.resource.data.id == driverId;
+        allow update: if can(shopId, 'manage_drivers') &&
+          resource.data.id == driverId &&
+          request.resource.data.version > resource.data.version;
+        allow delete: if false;
+      }
+
+      match /vehicles/{vehicleId} {
+        allow read: if isActiveMember(shopId);
+        allow write: if can(shopId, 'manage_drivers') && request.resource.data.id == vehicleId;
+      }
+
+      match /attendance/{attendanceId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_attendance') &&
+          request.resource.data.id == attendanceId;
+        allow update: if can(shopId, 'manage_attendance') &&
+          resource.data.id == attendanceId &&
+          request.resource.data.version > resource.data.version;
+        allow delete: if false;
+      }
+
+      match /salary_records/{salaryId} {
+        allow read: if can(shopId, 'manage_salaries') || isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_salaries') && request.resource.data.id == salaryId;
+        // Finalized payroll is immutable except for payment projection fields.
+        allow update: if can(shopId, 'manage_salaries') &&
+          resource.data.id == salaryId &&
+          (
+            resource.data.status != 'Paid' ||
+            request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['amount_paid_paise', 'balance_due_paise', 'status', 'updated_at',
+                        'sync_status', 'version', 'last_operation_id'])
+          );
+        allow delete: if false;
+      }
+
+      match /salary_payments/{paymentId} {
+        allow read: if can(shopId, 'manage_salaries');
+        allow create: if can(shopId, 'manage_salaries') &&
+          request.resource.data.id == paymentId &&
+          isNonEmptyString(request.resource.data.idempotency_key, 160);
+        allow update, delete: if false; // append-only; corrections are new records
+      }
+
+      match /sales/{saleId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'create_sales') &&
+          request.resource.data.id == saleId &&
+          request.resource.data.shop_id == shopId;
+        // A finalized invoice can never have its financial content changed.
+        allow update: if can(shopId, 'create_sales') &&
+          resource.data.id == saleId &&
+          (
+            !isFinalized(resource.data) ||
+            onlySyncFieldsChanged() ||
+            (
+              resource.data.document_status == 'finalized' &&
+              request.resource.data.document_status == 'cancelled' &&
+              request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                'document_status', 'cancelled_at', 'cancel_reason',
+                'updated_at', 'version', 'sync_status', 'last_operation_id'
+              ])
+            )
+          );
+        allow delete: if false;
+      }
+
+      match /sale_items/{itemId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'create_sales');
+        allow update: if can(shopId, 'create_sales') &&
+          !isFinalized(get(/databases/$(database)/documents/shops/$(shopId)/sales/$(resource.data.sale_id)).data);
+        allow delete: if false;
+      }
+
+      match /estimates/{estimateId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'create_sales') && request.resource.data.id == estimateId;
+        allow update: if can(shopId, 'create_sales') &&
+          resource.data.id == estimateId &&
+          request.resource.data.document_status != 'finalized';
+        allow delete: if false;
+      }
+
+      match /purchases/{purchaseId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_purchases') && request.resource.data.id == purchaseId;
+        allow update: if can(shopId, 'manage_purchases') &&
+          resource.data.id == purchaseId &&
+          (resource.data.status != 'finalized' || onlySyncFieldsChanged());
+        allow delete: if false;
+      }
+
+      match /purchase_items/{itemId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_purchases');
+        allow update: if can(shopId, 'manage_purchases');
+        allow delete: if false;
+      }
+
+      match /payments/{paymentId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'record_payments') &&
+          request.resource.data.id == paymentId &&
+          request.resource.data.shop_id == shopId &&
+          isNonEmptyString(request.resource.data.idempotency_key, 160) &&
+          isMoney(request.resource.data.amount_paise);
+        allow update, delete: if false; // corrections are new payments / credit notes
+      }
+
+      match /expenses/{expenseId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_expenses') && request.resource.data.id == expenseId;
+        allow update: if can(shopId, 'manage_expenses') &&
+          resource.data.id == expenseId &&
+          request.resource.data.version > resource.data.version;
+        allow delete: if false;
+      }
+
+      match /expense_categories/{categoryId} {
+        allow read: if isActiveMember(shopId);
+        allow write: if can(shopId, 'manage_expenses') && request.resource.data.id == categoryId;
+      }
+
+      match /returns/{returnId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_returns') && request.resource.data.id == returnId;
+        allow update: if can(shopId, 'manage_returns') &&
+          resource.data.id == returnId &&
+          request.resource.data.status == 'finalized' &&
+          resource.data.status != 'finalized';
+        allow delete: if false;
+      }
+
+      match /deliveries/{deliveryId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_deliveries') && request.resource.data.id == deliveryId;
+        allow update: if can(shopId, 'manage_deliveries') &&
+          resource.data.id == deliveryId &&
+          request.resource.data.version > resource.data.version;
+        allow delete: if false;
+      }
+
+      match /delivery_items/{itemId} {
+        allow read: if isActiveMember(shopId);
+        allow write: if can(shopId, 'manage_deliveries');
+      }
+
+      match /delivery_proofs/{proofId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'manage_deliveries') && request.resource.data.id == proofId;
+        allow update, delete: if false;
+      }
+
+      match /orders/{orderId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if can(shopId, 'create_sales') && request.resource.data.id == orderId;
+        allow update: if can(shopId, 'create_sales') &&
+          resource.data.id == orderId &&
+          request.resource.data.version > resource.data.version;
+        allow delete: if false;
+      }
+
+      match /image_metadata/{imageId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if isActiveMember(shopId) && request.resource.data.id == imageId;
+        allow update: if isActiveMember(shopId) &&
+          resource.data.owner_id == request.auth.uid;
+        allow delete: if isOwnerOrAdmin(shopId) || resource.data.owner_id == request.auth.uid;
+      }
+
+      match /audit_logs/{logId} {
+        allow read: if isOwnerOrAdmin(shopId);
+        allow create: if signedIn() &&
+          request.resource.data.actor_id == request.auth.uid &&
+          request.resource.data.shop_id == shopId &&
+          request.resource.data.id == logId;
+        allow update, delete: if false;
+      }
+
+      match /sync_metadata/{metadataId} {
+        allow read: if isActiveMember(shopId);
+        allow write: if isActiveMember(shopId);
+      }
+
+      match /sync_operations/{operationId} {
+        allow read: if isActiveMember(shopId);
+        allow create: if isActiveMember(shopId) &&
+          request.resource.data.operation_id == operationId &&
+          request.resource.data.shop_id == shopId &&
+          request.resource.data.device_id is string;
+        allow update, delete: if false;
+      }
+
+      match /number_sequences/{sequenceId} {
+        allow read: if isActiveMember(shopId);
+        allow write: if can(shopId, 'create_sales') || can(shopId, 'manage_business_settings');
+      }
+
+      // Catch-all: never allow an unlisted collection.
+      match /{document=**} {
+        allow read, write: if false;
+      }
+    }
+  }
+}
