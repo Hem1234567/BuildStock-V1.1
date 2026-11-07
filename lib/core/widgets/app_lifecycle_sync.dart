@@ -4,6 +4,9 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:buildstock/core/backup/backup_service.dart';
+import 'package:buildstock/core/media/image_service.dart';
+import 'package:buildstock/core/notifications/low_stock_notifier.dart';
 import 'package:buildstock/core/sync/sync_controller.dart';
 
 final connectivityProvider = StreamProvider<List<ConnectivityResult>>(
@@ -50,6 +53,27 @@ class _AppLifecycleSyncState extends ConsumerState<AppLifecycleSync>
     if (!mounted) return;
     if (!_started) _started = true;
     unawaited(ref.read(syncControllerProvider.notifier).run());
+    // Let the first frames and the first taps through before any background
+    // chores (photo upload, notifications, backup) start.
+    unawaited(
+      Future<void>.delayed(const Duration(seconds: 4), () async {
+        if (mounted) await _housekeeping();
+      }),
+    );
+  }
+
+  /// Background chores that must never disturb the user: upload waiting photos,
+  /// raise a low-stock alert and keep the daily local backup.
+  Future<void> _housekeeping() async {
+    try {
+      await ref.read(imageServiceProvider).uploadPending();
+    } catch (_) {}
+    try {
+      await ref.read(lowStockNotifierProvider).check();
+    } catch (_) {}
+    try {
+      await ref.read(backupServiceProvider).autoBackupIfDue();
+    } catch (_) {}
   }
 
   @override
